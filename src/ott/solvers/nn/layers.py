@@ -44,8 +44,10 @@ class PositiveDense(nn.Module):
   inv_rectifier_fn: Callable[[jnp.ndarray],
                              jnp.ndarray] = lambda x: jnp.log(jnp.exp(x) - 1)
   use_bias: bool = True
-  dtype: Any = jnp.float32
-  precision: Any = None
+  # dtype: Any = jnp.float32
+  # precision: Any = None
+  dtype: Any = jnp.float64
+  precision: Any = jax.lax.Precision.HIGHEST
   kernel_init: Callable[[PRNGKey, Shape, Dtype],
                         Array] = nn.initializers.lecun_normal()
   bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.zeros
@@ -92,8 +94,10 @@ class PosDefPotentials(nn.Module):
   dim_data: int
   num_potentials: int
   use_bias: bool = True
-  dtype: Any = jnp.float32
-  precision: Any = None
+  # dtype: Any = jnp.float32
+  # precision: Any = None
+  dtype: Any = jnp.float64
+  precision: Any = jax.lax.Precision.HIGHEST
   kernel_init: Callable[[PRNGKey, Shape, Dtype],
                         Array] = nn.initializers.lecun_normal()
   bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = nn.initializers.zeros
@@ -113,6 +117,7 @@ class PosDefPotentials(nn.Module):
         "kernel", self.kernel_init,
         (self.num_potentials, inputs.shape[-1], inputs.shape[-1])
     )
+    kernel = jnp.asarray(kernel, self.dtype)
 
     if self.use_bias:
       bias = self.param(

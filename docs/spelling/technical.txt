@@ -19,6 +19,7 @@ Kullback
 Leibler
 Mahalanobis
 Monge
+Moreau
 SGD
 Schur
 Seidel
@@ -26,6 +27,7 @@ Sinkhorn
 Unbalancedness
 Wasserstein
 adaptively
+backend
 backpropagates
 backpropagation
 barycenter
@@ -35,6 +37,7 @@ binarized
 boolean
 centroids
 checkpointing
+chromatin
 collinear
 covariance
 covariances
@@ -56,6 +59,7 @@ entropic
 epigenetic
 featurized
 grayscale
+heterogeneous
 histone
 hyperparameter
 hyperparameters
@@ -73,19 +77,24 @@ jax
 jit
 jitting
 linearization
+linearized
 logit
+macOS
 methylation
 neuroimaging
+normed
 numerics
 omics
 optimality
 overfitting
 parallelization
+parallelize
 parameterization
 parameterizing
 piecewise
 pluripotent
 positivity
+postfix
 potentials
 precompile
 precompute
@@ -94,6 +103,7 @@ preconditioner
 preprocess
 preprocessing
 proteome
+prox
 quantile
 quantiles
 quantizes
@@ -104,6 +114,7 @@ renormalize
 reproducibility
 rescale
 rescaled
+rescaling
 reweighted
 reweighting
 reweightings
@@ -123,9 +134,11 @@ subpopulation
 subpopulations
 subsample
 subsampled
+subsampling
 thresholding
 transcriptome
 undirected
 unscaled
+url
 vectorized
 voxel

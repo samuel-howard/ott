@@ -186,6 +186,9 @@ class TICost(CostFn):
 class SqPNorm(TICost):
   r"""Squared p-norm of the difference of two vectors.
 
+  Uses custom implementation of `norm` to avoid `NaN` values when
+  differentiating the norm of `x-x`.
+
   Args:
     p: Power of the p-norm, :math:`\ge 1`.
   """
@@ -196,14 +199,14 @@ class SqPNorm(TICost):
     self.q = 1.0 / (1.0 - (1.0 / p)) if p > 1.0 else jnp.inf
 
   def h(self, z: jnp.ndarray) -> float:  # noqa: D102
-    return 0.5 * jnp.linalg.norm(z, self.p) ** 2
+    return 0.5 * mu.norm(z, self.p) ** 2
 
   def h_legendre(self, z: jnp.ndarray) -> float:
     """Legendre transform of :func:`h`.
 
     For details on the derivation, see e.g., :cite:`boyd:04`, p. 93/94.
     """
-    return 0.5 * jnp.linalg.norm(z, self.q) ** 2
+    return 0.5 * mu.norm(z, self.q) ** 2
 
   def tree_flatten(self):  # noqa: D102
     return (), (self.p,)
@@ -218,6 +221,9 @@ class SqPNorm(TICost):
 class PNormP(TICost):
   r"""p-norm to the power p (and divided by p) of the difference of two vectors.
 
+  Uses custom implementation of `norm` to avoid `NaN` values when
+  differentiating the norm of `x-x`.
+
   Args:
     p: Power of the p-norm in :math:`[1, +\infty)`.
       Note that :func:`h_legendre` is not defined for ``p = 1``.
@@ -229,11 +235,11 @@ class PNormP(TICost):
     self.q = 1.0 / (1.0 - (1.0 / p)) if p > 1.0 else jnp.inf
 
   def h(self, z: jnp.ndarray) -> float:  # noqa: D102
-    return jnp.linalg.norm(z, self.p) ** self.p / self.p
+    return mu.norm(z, self.p) ** self.p / self.p
 
   def h_legendre(self, z: jnp.ndarray) -> float:  # noqa: D102
     # not defined for `p=1`
-    return jnp.linalg.norm(z, self.q) ** self.q / self.q
+    return mu.norm(z, self.q) ** self.q / self.q
 
   def tree_flatten(self):  # noqa: D102
     return (), (self.p,)
@@ -255,8 +261,13 @@ class Euclidean(CostFn):
   """
 
   def pairwise(self, x: jnp.ndarray, y: jnp.ndarray) -> float:
-    """Compute Euclidean norm."""
-    return jnp.linalg.norm(x - y)
+    """Compute Euclidean norm using custom jvp implementation.
+
+    Here we use a custom jvp implementation for the norm that does not yield
+    `NaN` gradients when differentiating the norm of `(x-x)`, but defaults
+    instead to zero, using a `custom_jvp` rule.
+    """
+    return mu.norm(x - y)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -315,13 +326,14 @@ class RegTICost(TICost, abc.ABC):
   r"""Base class for regularized translation-invariant costs.
 
   .. math::
-    \frac{1}{2} \|\cdot\|_2^2 + \text{scaling_reg} reg\left(\cdot\right)
+    \frac{1}{2} \|\cdot\|_2^2 + \text{scaling_reg} reg\left(matrix \cdot\right)
 
   where :func:`reg` is the regularization function.
 
   Args:
     scaling_reg: Strength of the :meth:`regularization <reg>`.
-    matrix: :math:`p \times d` projection matrix with **orthogonal rows**.
+    matrix: :math:`p \times d` projection matrix in the Stiefel manifold,
+      namely with **orthonormalized rows**.
     orthogonal: Whether to regularize in the orthogonal complement
       to promote displacements in the span of ``matrix``.
   """
@@ -417,7 +429,7 @@ class RegTICost(TICost, abc.ABC):
     return z - tau * self.prox_reg(z / tau, 1.0 / tau)
 
   def h(self, z: jnp.ndarray) -> float:  # noqa: D102
-    out = 0.5 * jnp.linalg.norm(z, ord=2) ** 2
+    out = 0.5 * jnp.sum(z ** 2)
     return out + self.scaling_reg * self.reg(z)
 
   def h_legendre(self, z: jnp.ndarray) -> float:  # noqa: D102
@@ -602,8 +614,8 @@ class ElasticSqKOverlap(RegTICost):
     # Choose first index satisfying constraint in Prop 2.1
     lower_bound = cesaro - top_w >= 0
     # Last upper bound is always True.
-    upper_bound = jnp.concatenate(((top_w[1:] - cesaro[:-1] > 0),
-                                   jnp.array((True,))))
+    upper_bound = jnp.concatenate(((top_w[1:] - cesaro[:-1]
+                                    > 0), jnp.array((True,))))
     r = jnp.argmax(lower_bound * upper_bound)
     s = jnp.sum(jnp.where(jnp.arange(k) < k - r - 1, jnp.flip(top_w) ** 2, 0))
 

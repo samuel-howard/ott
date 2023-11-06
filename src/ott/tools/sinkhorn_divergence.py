@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from types import MappingProxyType
-from typing import Any, List, Mapping, NamedTuple, Optional, Tuple, Type
+from typing import Any, Mapping, NamedTuple, Optional, Tuple, Type
 
 import jax.numpy as jnp
 
 from ott.geometry import costs, geometry, pointcloud, segment
 from ott.problems.linear import linear_problem, potentials
+from ott.solvers import linear
 from ott.solvers.linear import acceleration, sinkhorn
 
 __all__ = [
@@ -25,16 +26,19 @@ __all__ = [
     "SinkhornDivergenceOutput"
 ]
 
+Potentials_t = Tuple[jnp.ndarray, jnp.ndarray]
+
 
 class SinkhornDivergenceOutput(NamedTuple):  # noqa: D101
   divergence: float
-  potentials: Tuple[List[jnp.ndarray], List[jnp.ndarray], List[jnp.ndarray]]
+  potentials: Tuple[Potentials_t, Potentials_t, Potentials_t]
   geoms: Tuple[geometry.Geometry, geometry.Geometry, geometry.Geometry]
   errors: Tuple[Optional[jnp.ndarray], Optional[jnp.ndarray],
                 Optional[jnp.ndarray]]
   converged: Tuple[bool, bool, bool]
   a: jnp.ndarray
   b: jnp.ndarray
+  n_iters: Tuple[int, int, int]
 
   def to_dual_potentials(self) -> "potentials.EntropicPotentials":
     """Return dual estimators :cite:`pooladian:22`, eq. 8."""
@@ -163,26 +167,34 @@ def _sinkhorn_divergence(
     if implicit_diff is not None:
       kwargs_symmetric["implicit_diff"] = implicit_diff.replace(symmetric=True)
 
-  out_xy = sinkhorn.solve(geometry_xy, a, b, **kwargs)
-  out_xx = sinkhorn.solve(geometry_xx, a, a, **kwargs_symmetric)
+  out_xy = linear.solve(geometry_xy, a, b, **kwargs)
+  out_xx = linear.solve(geometry_xx, a, a, **kwargs_symmetric)
   if geometry_yy is None:
     # Create dummy output, corresponds to scenario where static_b is True.
     # This choice ensures that `converged`` of this dummy output is True.
     out_yy = sinkhorn.SinkhornOutput(
-        errors=jnp.array([-jnp.inf]), reg_ot_cost=0.0, threshold=0.0
+        errors=jnp.array([-jnp.inf]),
+        reg_ot_cost=0.0,
+        threshold=0.0,
+        inner_iterations=0,
     )
   else:
-    out_yy = sinkhorn.solve(geometry_yy, b, b, **kwargs_symmetric)
+    out_yy = linear.solve(geometry_yy, b, b, **kwargs_symmetric)
 
   div = (
       out_xy.reg_ot_cost - 0.5 * (out_xx.reg_ot_cost + out_yy.reg_ot_cost) +
       0.5 * geometry_xy.epsilon * (jnp.sum(a) - jnp.sum(b)) ** 2
   )
-  out = (out_xy, out_xx, out_yy)
   return SinkhornDivergenceOutput(
-      div, tuple([s.f, s.g] for s in out),
-      (geometry_xy, geometry_xx, geometry_yy), tuple(s.errors for s in out),
-      tuple(s.converged for s in out), a, b
+      divergence=div,
+      potentials=((out_xy.f, out_xy.g), (out_xx.f, out_xx.g),
+                  (out_yy.f, out_yy.g)),
+      geoms=(geometry_xy, geometry_xx, geometry_yy),
+      errors=(out_xy.errors, out_xx.errors, out_yy.errors),
+      converged=(out_xy.converged, out_xx.converged, out_yy.converged),
+      a=a,
+      b=b,
+      n_iters=(out_xy.n_iters, out_xx.n_iters, out_yy.n_iters),
   )
 
 

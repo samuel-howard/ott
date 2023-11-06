@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A Jax implementation of the Low-Rank Sinkhorn algorithm."""
 from typing import (
     Any,
     Callable,
@@ -24,13 +23,13 @@ from typing import (
 )
 
 import jax
+import jax.experimental
 import jax.numpy as jnp
 import jax.scipy as jsp
 import numpy as np
-from jax.experimental import host_callback
 
-from ott.geometry import geometry, low_rank, pointcloud
-from ott.initializers.linear import initializers_lr as init_lib
+from ott.geometry import geometry
+from ott.initializers.linear import initializers_lr
 from ott.math import fixed_point_loop
 from ott.math import utils as mu
 from ott.problems.linear import linear_problem
@@ -55,9 +54,9 @@ class LRSinkhornState(NamedTuple):
   def compute_error(  # noqa: D102
       self, previous_state: "LRSinkhornState"
   ) -> float:
-    err_q = mu.js(self.q, previous_state.q, c=1.0)
-    err_r = mu.js(self.r, previous_state.r, c=1.0)
-    err_g = mu.js(self.g, previous_state.g, c=1.0)
+    err_q = mu.gen_js(self.q, previous_state.q, c=1.0)
+    err_r = mu.gen_js(self.r, previous_state.r, c=1.0)
+    err_g = mu.gen_js(self.g, previous_state.g, c=1.0)
 
     return ((1.0 / self.gamma) ** 2) * (err_q + err_r + err_g)
 
@@ -165,7 +164,7 @@ def solution_error(
 
 
 class LRSinkhornOutput(NamedTuple):
-  """Implement the problems.Transport interface, for a LR Sinkhorn solution."""
+  """Transport interface for a low-rank Sinkhorn solution."""
 
   q: jnp.ndarray
   r: jnp.ndarray
@@ -176,6 +175,7 @@ class LRSinkhornOutput(NamedTuple):
   errors: jnp.ndarray
   ot_prob: linear_problem.LinearProblem
   epsilon: float
+  inner_iterations: int
   # TODO(michalk8): Optional is an artifact of the current impl., refactor
   reg_ot_cost: Optional[float] = None
 
@@ -207,10 +207,6 @@ class LRSinkhornOutput(NamedTuple):
     )
 
   @property
-  def linear(self) -> bool:  # noqa: D102
-    return isinstance(self.ot_prob, linear_problem.LinearProblem)
-
-  @property
   def geom(self) -> geometry.Geometry:  # noqa: D102
     return self.ot_prob.geom
 
@@ -223,8 +219,8 @@ class LRSinkhornOutput(NamedTuple):
     return self.ot_prob.b
 
   @property
-  def linear_output(self) -> bool:  # noqa: D102
-    return True
+  def n_iters(self) -> int:  # noqa: D102
+    return jnp.sum(self.errors != -1) * self.inner_iterations
 
   @property
   def converged(self) -> bool:  # noqa: D102
@@ -272,15 +268,14 @@ class LRSinkhornOutput(NamedTuple):
 
 @jax.tree_util.register_pytree_node_class
 class LRSinkhorn(sinkhorn.Sinkhorn):
-  r"""A Low-Rank Sinkhorn solver for linear reg-OT problems.
+  r"""Low-Rank Sinkhorn solver for linear reg-OT problems.
 
   The algorithm is described in :cite:`scetbon:21` and the implementation
   contained here is adapted from `LOT <https://github.com/meyerscetbon/LOT>`_.
 
   The algorithm minimizes a non-convex problem. It therefore requires special
   care to initialization and convergence. Convergence is evaluated on successive
-  evaluations of the objective. The algorithm is only provided for the balanced
-  case.
+  evaluations of the objective.
 
   Args:
     rank: Rank constraint on the coupling to minimize the linear OT problem
@@ -289,20 +284,12 @@ class LRSinkhorn(sinkhorn.Sinkhorn):
       described in :cite:`scetbon:22b`.
     epsilon: Entropic regularization added on top of low-rank problem.
     initializer: How to initialize the :math:`Q`, :math:`R` and :math:`g`
-      factors. Valid options are `'random'`, `'rank2'`, `'k-means'`, and
-      `'generalized-k-means`. If `None`,
-      :class:`~ott.initializers.linear.initializers_lr.KMeansInitializer`
-      is used when the linear problem's geometry is
-      :class:`~ott.geometry.pointcloud.PointCloud` or
-      :class:`~ott.geometry.low_rank.LRCGeometry`. Otherwise, use
-      :class:`~ott.initializers.linear.initializers_lr.RandomInitializer`.
-    lse_mode: Whether to run computations in lse or kernel mode.
+      factors.
+    lse_mode: Whether to run computations in LSE or kernel mode.
     inner_iterations: Number of inner iterations used by the algorithm before
       re-evaluating progress.
     use_danskin: Use Danskin theorem to evaluate gradient of objective w.r.t.
       input parameters. Only `True` handled at this moment.
-    implicit_diff: Whether to use implicit differentiation. Currently, only
-      ``implicit_diff = False`` is implemented.
     progress_fn: callback function which gets called during the Sinkhorn
       iterations, so the user can display the error at each iteration,
       e.g., using a progress bar. See :func:`~ott.utils.default_progress_fn`
@@ -322,25 +309,23 @@ class LRSinkhorn(sinkhorn.Sinkhorn):
       rank: int,
       gamma: float = 10.,
       gamma_rescale: bool = True,
-      epsilon: float = 0.,
-      initializer: Optional[Union[Literal["random", "rank2", "k-means",
-                                          "generalized-k-means"],
-                                  init_lib.LRInitializer]] = "random",
+      epsilon: float = 0.0,
+      initializer: Union[Literal["random", "rank2", "k-means",
+                                 "generalized-k-means"],
+                         initializers_lr.LRInitializer] = "random",
       lse_mode: bool = True,
       inner_iterations: int = 10,
       use_danskin: bool = True,
-      implicit_diff: bool = False,
       kwargs_dys: Optional[Mapping[str, Any]] = None,
       kwargs_init: Optional[Mapping[str, Any]] = None,
       progress_fn: Optional[ProgressCallbackFn_t] = None,
       **kwargs: Any,
   ):
-    assert not implicit_diff, "Implicit diff. not yet implemented."
+    kwargs["implicit_diff"] = None  # not yet implemented
     super().__init__(
         lse_mode=lse_mode,
         inner_iterations=inner_iterations,
         use_danskin=use_danskin,
-        implicit_diff=implicit_diff,
         **kwargs
     )
     self.rank = rank
@@ -391,16 +376,16 @@ class LRSinkhorn(sinkhorn.Sinkhorn):
         mu.safe_log(state.q), mu.safe_log(state.r), mu.safe_log(state.g)
     )
 
-    grad_q = ot_prob.geom.apply_cost(state.r, axis=1) / state.g[None, :]
-    grad_r = ot_prob.geom.apply_cost(state.q) / state.g[None, :]
-    diag_qcr = jnp.sum(
-        state.q * ot_prob.geom.apply_cost(state.r, axis=1), axis=0
-    )
-    grad_g = -diag_qcr / (state.g ** 2)
-    if self.is_entropic:
-      grad_q += self.epsilon * log_q
-      grad_r += self.epsilon * log_r
-      grad_g += self.epsilon * log_g
+    inv_g = 1.0 / state.g[None, :]
+    tmp = ot_prob.geom.apply_cost(state.r, axis=1)
+
+    grad_q = tmp * inv_g
+    grad_r = ot_prob.geom.apply_cost(state.q) * inv_g
+    grad_g = -jnp.sum(state.q * tmp, axis=0) / (state.g ** 2)
+
+    grad_q += self.epsilon * log_q
+    grad_r += self.epsilon * log_r
+    grad_g += self.epsilon * log_g
 
     if self.gamma_rescale:
       norm_q = jnp.max(jnp.abs(grad_q)) ** 2
@@ -718,8 +703,8 @@ class LRSinkhorn(sinkhorn.Sinkhorn):
     )
 
     if self.progress_fn is not None:
-      host_callback.id_tap(
-          self.progress_fn,
+      jax.experimental.io_callback(
+          self.progress_fn, None,
           (iteration, self.inner_iterations, self.max_iterations, state)
       )
 
@@ -729,14 +714,9 @@ class LRSinkhorn(sinkhorn.Sinkhorn):
   def norm_error(self) -> Tuple[int]:  # noqa: D102
     return self._norm_error,
 
-  @property
-  def is_entropic(self) -> bool:
-    """Whether entropy regularization is used."""
-    return self.epsilon > 0.
-
   def create_initializer(
       self, prob: linear_problem.LinearProblem
-  ) -> init_lib.LRInitializer:
+  ) -> initializers_lr.LRInitializer:
     """Create a low-rank Sinkhorn initializer.
 
     Args:
@@ -745,24 +725,14 @@ class LRSinkhorn(sinkhorn.Sinkhorn):
     Returns:
       Low-rank initializer.
     """
-    if isinstance(self.initializer, init_lib.LRInitializer):
-      initializer = self.initializer
-    elif self.initializer is None:
-      kind = "k-means" if isinstance(
-          prob.geom, (pointcloud.PointCloud, low_rank.LRCGeometry)
-      ) else "random"
-      initializer = init_lib.LRInitializer.from_solver(
-          self, kind=kind, **self.kwargs_init
-      )
-    else:
-      initializer = init_lib.LRInitializer.from_solver(
-          self, kind=self.initializer, **self.kwargs_init
-      )
-
-    assert initializer.rank == self.rank, \
-        f"Expected initializer of rank `{self.rank}`, " \
-        f"found `{initializer.rank}`."
-    return initializer
+    if isinstance(self.initializer, initializers_lr.LRInitializer):
+      assert self.initializer.rank == self.rank, \
+        f"Expected initializer's rank to be `{self.rank}`," \
+        f"found `{self.initializer.rank}`."
+      return self.initializer
+    return initializers_lr.LRInitializer.from_solver(
+        self, kind=self.initializer, **self.kwargs_init
+    )
 
   def init_state(
       self, ot_prob: linear_problem.LinearProblem,
@@ -800,6 +770,7 @@ class LRSinkhorn(sinkhorn.Sinkhorn):
         costs=state.costs,
         errors=state.errors,
         epsilon=self.epsilon,
+        inner_iterations=self.inner_iterations,
     )
 
   def _converged(self, state: LRSinkhornState, iteration: int) -> bool:

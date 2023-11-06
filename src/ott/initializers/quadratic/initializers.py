@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import abc
-from typing import TYPE_CHECKING, Any, Dict, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -20,11 +20,10 @@ import jax.numpy as jnp
 from ott.geometry import geometry
 
 if TYPE_CHECKING:
-  from ott.initializers.linear import initializers_lr
   from ott.problems.linear import linear_problem
   from ott.problems.quadratic import quadratic_problem
 
-__all__ = ["QuadraticInitializer", "LRQuadraticInitializer"]
+__all__ = ["BaseQuadraticInitializer", "QuadraticInitializer"]
 
 
 @jax.tree_util.register_pytree_node_class
@@ -54,14 +53,16 @@ class BaseQuadraticInitializer(abc.ABC):
 
     n, m = quad_prob.geom_xx.shape[0], quad_prob.geom_yy.shape[0]
     geom = self._create_geometry(quad_prob, **kwargs)
-    assert geom.shape == (n, m), f"Expected geometry of shape `{n, m}`, " \
-                                 f"found `{geom.shape}`."
+    assert geom.shape == (n, m), (
+        f"Expected geometry of shape `{n, m}`, "
+        f"found `{geom.shape}`."
+    )
     return linear_problem.LinearProblem(
         geom,
         a=quad_prob.a,
         b=quad_prob.b,
         tau_a=quad_prob.tau_a,
-        tau_b=quad_prob.tau_b
+        tau_b=quad_prob.tau_b,
     )
 
   @abc.abstractmethod
@@ -89,7 +90,7 @@ class BaseQuadraticInitializer(abc.ABC):
 
 
 class QuadraticInitializer(BaseQuadraticInitializer):
-  r"""Initialize a linear problem locally around :math:`ab^T` initializer.
+  r"""Initialize a linear problem locally around a selected coupling.
 
   If the problem is balanced (``tau_a = 1`` and ``tau_b = 1``),
   the equation of the cost follows eq. 6, p. 1 of :cite:`peyre:16`.
@@ -114,36 +115,57 @@ class QuadraticInitializer(BaseQuadraticInitializer):
   .. math::
 
     \text{marginal_dep_term} + \text{left}_x(\text{cost_xx}) P
-     \text{right}_y(\text{cost_yy}) + \text{unbalanced_correction}
+    \text{right}_y(\text{cost_yy}) + \text{unbalanced_correction}
 
   When working with the fused problem, a linear term is added to the cost
   matrix: `cost_matrix` += `fused_penalty` * `geom_xy.cost_matrix`
+
+  Args:
+    init_coupling: The coupling to use for initialization. If :obj:`None`,
+      defaults to the product coupling :math:`ab^T`.
   """
 
+  def __init__(
+      self, init_coupling: Optional[jnp.ndarray] = None, **kwargs: Any
+  ):
+    super().__init__(**kwargs)
+    self.init_coupling = init_coupling
+
   def _create_geometry(
-      self, quad_prob: "quadratic_problem.QuadraticProblem", *, epsilon: float,
-      **kwargs: Any
+      self,
+      quad_prob: "quadratic_problem.QuadraticProblem",
+      *,
+      epsilon: float,
+      relative_epsilon: Optional[bool] = None,
+      **kwargs: Any,
   ) -> geometry.Geometry:
     """Compute initial geometry for linearization.
 
     Args:
       quad_prob: Quadratic OT problem.
       epsilon: Epsilon regularization.
-      kwargs: Additional keyword arguments, unused.
+      relative_epsilon: Flag, use `relative_epsilon` or not in geometry.
+      kwargs: Keyword arguments for :class:`~ott.geometry.geometry.Geometry`.
 
     Returns:
       The initial geometry used to initialize the linearized problem.
     """
     from ott.problems.quadratic import quadratic_problem
+
     del kwargs
 
     marginal_cost = quad_prob.marginal_dependent_cost(quad_prob.a, quad_prob.b)
     geom_xx, geom_yy = quad_prob.geom_xx, quad_prob.geom_yy
 
     h1, h2 = quad_prob.quad_loss
-    tmp1 = quadratic_problem.apply_cost(geom_xx, quad_prob.a, axis=1, fn=h1)
-    tmp2 = quadratic_problem.apply_cost(geom_yy, quad_prob.b, axis=1, fn=h2)
-    tmp = jnp.outer(tmp1, tmp2)
+    if self.init_coupling is None:
+      tmp1 = quadratic_problem.apply_cost(geom_xx, quad_prob.a, axis=1, fn=h1)
+      tmp2 = quadratic_problem.apply_cost(geom_yy, quad_prob.b, axis=1, fn=h2)
+      tmp = jnp.outer(tmp1, tmp2)
+    else:
+      tmp1 = h1.func(geom_xx.cost_matrix)
+      tmp2 = h2.func(geom_yy.cost_matrix)
+      tmp = tmp1 @ self.init_coupling @ tmp2.T
 
     if quad_prob.is_balanced:
       cost_matrix = marginal_cost.cost_matrix - tmp
@@ -160,54 +182,12 @@ class QuadraticInitializer(BaseQuadraticInitializer):
       )
       cost_matrix = marginal_cost.cost_matrix - tmp + unbalanced_correction
 
-    cost_matrix += quad_prob.fused_penalty * quad_prob._fused_cost_matrix()
-    return geometry.Geometry(cost_matrix=cost_matrix, epsilon=epsilon)
-
-
-class LRQuadraticInitializer(BaseQuadraticInitializer):
-  """Wrapper that wraps low-rank Sinkhorn initializers.
-
-  Args:
-    lr_linear_initializer: Low-rank linear initializer.
-  """
-
-  def __init__(self, lr_linear_initializer: "initializers_lr.LRInitializer"):
-    super().__init__()
-    self._linear_lr_initializer = lr_linear_initializer
-
-  def _create_geometry(
-      self, quad_prob: "quadratic_problem.QuadraticProblem", **kwargs: Any
-  ) -> geometry.Geometry:
-    """Compute initial geometry for linearization.
-
-    Args:
-      quad_prob: Quadratic OT problem.
-      kwargs: Keyword arguments for
-        :meth:`~ott.initializers.linear.initializers_lr.LRInitializer.__call__`.
-
-    Returns:
-      The initial geometry used to initialize a linear problem.
-    """
-    from ott.solvers.linear import sinkhorn_lr
-
-    q, r, g = self._linear_lr_initializer(quad_prob, **kwargs)
-    tmp_out = sinkhorn_lr.LRSinkhornOutput(
-        q=q,
-        r=r,
-        g=g,
-        costs=None,
-        errors=None,
-        ot_prob=None,
-        epsilon=None,
+    cost_matrix += quad_prob.fused_penalty * quad_prob._fused_cost_matrix
+    return geometry.Geometry(
+        cost_matrix=cost_matrix,
+        epsilon=epsilon,
+        relative_epsilon=relative_epsilon
     )
 
-    return quad_prob.update_lr_geom(tmp_out)
-
-  @property
-  def rank(self) -> int:
-    """Rank of the transport matrix factorization."""
-    return self._linear_lr_initializer.rank
-
   def tree_flatten(self) -> Tuple[Sequence[Any], Dict[str, Any]]:  # noqa: D102
-    children, aux_data = super().tree_flatten()
-    return children + [self._linear_lr_initializer], aux_data
+    return [self.init_coupling], self._kwargs

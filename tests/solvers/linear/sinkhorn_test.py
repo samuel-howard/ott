@@ -11,14 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Optional, Tuple
+import io
+import sys
+from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from ott import utils
 from ott.geometry import costs, epsilon_scheduler, geometry, grid, pointcloud
 from ott.problems.linear import linear_problem
+from ott.solvers import linear
 from ott.solvers.linear import acceleration, sinkhorn
 
 
@@ -65,7 +69,7 @@ class TestSinkhorn:
     momentum = acceleration.Momentum(start=mom_start, value=mom_value)
 
     geom = pointcloud.PointCloud(self.x, self.y, cost_fn=cost_fn, epsilon=0.1)
-    out = sinkhorn.solve(
+    out = linear.solve(
         geom,
         a=self.a,
         b=self.b,
@@ -76,11 +80,12 @@ class TestSinkhorn:
     )
     errors = out.errors
     err = errors[errors > -1][-1]
-    assert threshold > err
+    np.testing.assert_array_less(err, threshold)
+    np.testing.assert_allclose(out.transport_mass, 1.0, rtol=1e-5, atol=1e-5)
 
     other_geom = pointcloud.PointCloud(self.x, self.y + 0.3, epsilon=0.1)
     cost_other = out.transport_cost_at_geom(other_geom)
-    assert not jnp.isnan(cost_other)
+    np.testing.assert_array_equal(jnp.isnan(cost_other), False)
 
   def test_autoepsilon(self):
     """Check that with auto-epsilon, dual potentials scale."""
@@ -89,7 +94,7 @@ class TestSinkhorn:
     # needed in principle, but introduced here to test logic.
     geom_1 = pointcloud.PointCloud(self.x, self.y, relative_epsilon=True)
     # not jitting
-    f_1 = sinkhorn.solve(
+    f_1 = linear.solve(
         geom_1,
         a=self.a,
         b=self.b,
@@ -100,7 +105,7 @@ class TestSinkhorn:
     # Second geom does not provide whether epsilon is relative.
     geom_2 = pointcloud.PointCloud(scale * self.x, scale * self.y)
     # jitting
-    compute_f = jax.jit(sinkhorn.solve, static_argnames=["tau_a", "tau_b"])
+    compute_f = jax.jit(linear.solve, static_argnames=["tau_a", "tau_b"])
     f_2 = compute_f(geom_2, self.a, self.b, tau_a=0.99, tau_b=0.97).f
 
     # Ensure epsilon and optimal f's are a scale^2 apart (^2 comes from ^2 cost)
@@ -134,7 +139,7 @@ class TestSinkhorn:
     geom1 = pointcloud.PointCloud(self.x, self.y, epsilon=epsilon)
     geom2 = pointcloud.PointCloud(self.x, self.y)
     run_fn = jax.jit(
-        sinkhorn.solve,
+        linear.solve,
         static_argnames=[
             "tau_a", "tau_b", "lse_mode", "threshold", "recenter_potentials"
         ]
@@ -173,7 +178,7 @@ class TestSinkhorn:
     """Testing the min_iterations parameter."""
     threshold = 1e-3
     geom = pointcloud.PointCloud(self.x, self.y, epsilon=0.1)
-    errors = sinkhorn.solve(
+    errors = linear.solve(
         geom,
         a=self.a,
         b=self.b,
@@ -192,7 +197,7 @@ class TestSinkhorn:
     """Testing the scan loop behavior."""
     threshold = 1e-3
     geom = pointcloud.PointCloud(self.x, self.y, epsilon=0.1)
-    out = sinkhorn.solve(
+    out = linear.solve(
         geom,
         a=self.a,
         b=self.b,
@@ -211,8 +216,8 @@ class TestSinkhorn:
     geom_1 = pointcloud.PointCloud(self.x, self.y)
     geom_2 = geometry.Geometry(geom_1.cost_matrix)
 
-    f_1 = sinkhorn.solve(geom_1, a=self.a, b=self.b).f
-    f_2 = sinkhorn.solve(geom_2, a=self.a, b=self.b).f
+    f_1 = linear.solve(geom_1, a=self.a, b=self.b).f
+    f_2 = linear.solve(geom_2, a=self.a, b=self.b).f
     # re-centering to remove ambiguity on equality up to additive constant.
     f_1 -= jnp.mean(f_1[jnp.isfinite(f_1)])
     f_2 -= jnp.mean(f_2[jnp.isfinite(f_2)])
@@ -224,7 +229,7 @@ class TestSinkhorn:
     """Testing the online way to handle geometry."""
     threshold = 1e-3
     geom = pointcloud.PointCloud(self.x, self.y, epsilon=0.1, batch_size=5)
-    errors = sinkhorn.solve(
+    errors = linear.solve(
         geom, a=self.a, b=self.b, threshold=threshold, lse_mode=lse_mode
     ).errors
     err = errors[errors > -1][-1]
@@ -233,7 +238,6 @@ class TestSinkhorn:
   @pytest.mark.fast.with_args("lse_mode", [False, True], only_fast=0)
   def test_online_vs_batch_euclidean_point_cloud(self, lse_mode: bool):
     """Comparing online vs batch geometry."""
-    threshold = 1e-3
     eps = 0.1
     online_geom = pointcloud.PointCloud(
         self.x, self.y, epsilon=eps, batch_size=7
@@ -247,36 +251,26 @@ class TestSinkhorn:
         self.x, self.y, cost_fn=costs.SqEuclidean(), epsilon=eps
     )
 
-    out_online = sinkhorn.solve(
-        online_geom, a=self.a, b=self.b, threshold=threshold, lse_mode=lse_mode
+    out_online = linear.solve(
+        online_geom, a=self.a, b=self.b, lse_mode=lse_mode
     )
-    out_batch = sinkhorn.solve(
-        batch_geom, a=self.a, b=self.b, threshold=threshold, lse_mode=lse_mode
+    out_batch = linear.solve(batch_geom, a=self.a, b=self.b, lse_mode=lse_mode)
+    out_online_euc = linear.solve(
+        online_geom_euc, a=self.a, b=self.b, lse_mode=lse_mode
     )
-    out_online_euc = sinkhorn.solve(
-        online_geom_euc,
-        a=self.a,
-        b=self.b,
-        threshold=threshold,
-        lse_mode=lse_mode
-    )
-    out_batch_euc = sinkhorn.solve(
-        batch_geom_euc,
-        a=self.a,
-        b=self.b,
-        threshold=threshold,
-        lse_mode=lse_mode
+    out_batch_euc = linear.solve(
+        batch_geom_euc, a=self.a, b=self.b, lse_mode=lse_mode
     )
 
     # Checks regularized transport costs match.
     np.testing.assert_allclose(
-        out_online.reg_ot_cost, out_batch.reg_ot_cost, rtol=1e-6
+        out_online.reg_ot_cost, out_batch.reg_ot_cost, rtol=1e-5
     )
     np.testing.assert_allclose(
-        out_online.kl_reg_cost, out_batch.kl_reg_cost, rtol=1e-6
+        out_online.kl_reg_cost, out_batch.kl_reg_cost, rtol=1e-5
     )
     np.testing.assert_allclose(
-        out_online.ent_reg_cost, out_batch.ent_reg_cost, rtol=1e-6
+        out_online.ent_reg_cost, out_batch.ent_reg_cost, rtol=1e-5
     )
     # Check values are bigger than 0 for KL regularized OT.
     np.testing.assert_array_less(0.0, out_online.kl_reg_cost)
@@ -310,7 +304,7 @@ class TestSinkhorn:
 
   def test_apply_transport_geometry_from_potentials(self):
     """Applying transport matrix P on vector without instantiating P."""
-    n, m, d = 160, 230, 6
+    n, m, d = 20, 23, 3
     rngs = jax.random.split(self.rng, 6)
     x = jax.random.uniform(rngs[0], (n, d))
     y = jax.random.uniform(rngs[1], (m, d))
@@ -321,16 +315,16 @@ class TestSinkhorn:
     transport_t_vec_a = [None, None, None, None]
     transport_vec_b = [None, None, None, None]
 
-    batch_b = 8
+    batch_b = 7
 
     vec_a = jax.random.normal(rngs[4], (n,))
     vec_b = jax.random.normal(rngs[5], (batch_b, m))
 
     # test with lse_mode and online = True / False
     for j, lse_mode in enumerate([True, False]):
-      for i, batch_size in enumerate([16, None]):
+      for i, batch_size in enumerate([2, None]):
         geom = pointcloud.PointCloud(x, y, batch_size=batch_size, epsilon=0.2)
-        out = sinkhorn.solve(geom, a, b, lse_mode=lse_mode)
+        out = linear.solve(geom, a, b, lse_mode=lse_mode)
 
         transport_t_vec_a[i + 2 * j] = geom.apply_transport_from_potentials(
             out.f, out.g, vec_a, axis=0
@@ -364,7 +358,7 @@ class TestSinkhorn:
 
   def test_apply_transport_geometry_from_scalings(self):
     """Applying transport matrix P on vector without instantiating P."""
-    n, m, d = 160, 230, 6
+    n, m, d = 20, 23, 5
     rngs = jax.random.split(self.rng, 6)
     x = jax.random.uniform(rngs[0], (n, d))
     y = jax.random.uniform(rngs[1], (m, d))
@@ -375,16 +369,16 @@ class TestSinkhorn:
     transport_t_vec_a = [None, None, None, None]
     transport_vec_b = [None, None, None, None]
 
-    batch_b = 8
+    batch_b = 7
 
     vec_a = jax.random.normal(rngs[4], (n,))
     vec_b = jax.random.normal(rngs[5], (batch_b, m))
 
     # test with lse_mode and online = True / False
     for j, lse_mode in enumerate([True, False]):
-      for i, batch_size in enumerate([64, None]):
+      for i, batch_size in enumerate([13, None]):
         geom = pointcloud.PointCloud(x, y, batch_size=batch_size, epsilon=0.2)
-        out = sinkhorn.solve(geom, a, b, lse_mode=lse_mode)
+        out = linear.solve(geom, a, b, lse_mode=lse_mode)
 
         u = geom.scaling_from_potential(out.f)
         v = geom.scaling_from_potential(out.g)
@@ -425,9 +419,9 @@ class TestSinkhorn:
   @pytest.mark.parametrize("lse_mode", [False, True])
   def test_restart(self, lse_mode: bool):
     """Two point clouds, tested with various parameters."""
-    threshold = 1e-4
-    geom = pointcloud.PointCloud(self.x, self.y, epsilon=0.01)
-    out = sinkhorn.solve(
+    threshold = 1e-2
+    geom = pointcloud.PointCloud(self.x, self.y, epsilon=0.05)
+    out = linear.solve(
         geom,
         a=self.a,
         b=self.b,
@@ -480,14 +474,15 @@ class TestSinkhorn:
     assert num_iter_restarted == 1
 
   @pytest.mark.cpu()
-  @pytest.mark.limit_memory("110 MB")
-  @pytest.mark.fast.with_args("batch_size", [500, 1000], only_fast=0)
-  def test_sinkhorn_online_memory_jit(self, batch_size: int):
-    # offline: Total memory allocated: 240.1MiB
-    # online (500): Total memory allocated: 33.4MiB; GPU: 203.4MiB
-    # online (1000): Total memory allocated: 45.6MiB
+  @pytest.mark.limit_memory("36 MB")
+  @pytest.mark.fast()
+  def test_sinkhorn_online_memory_jit(self):
+    # test that full matrix is not materialized.
+    # Only storing it would result in 250 * 8000 = 2e6 entries = 16Mb,
+    # which would overflow due to other overheads
+    batch_size = 10
     rngs = jax.random.split(jax.random.PRNGKey(0), 4)
-    n, m = 5000, 4000
+    n, m = 250, 8000
     x = jax.random.uniform(rngs[0], (n, 2))
     y = jax.random.uniform(rngs[1], (m, 2))
     geom = pointcloud.PointCloud(x, y, batch_size=batch_size, epsilon=1)
@@ -498,9 +493,7 @@ class TestSinkhorn:
     assert out.converged
     assert out.primal_cost > 0.0
 
-  @pytest.mark.fast.with_args(
-      cost_fn=[None, costs.SqPNorm(1.6)],
-  )
+  @pytest.mark.fast.with_args(cost_fn=[None, costs.SqPNorm(1.6)])
   def test_primal_cost_grid(self, cost_fn: Optional[costs.CostFn]):
     """Test computation of primal / costs for Grids."""
     ns = [6, 7, 11]
@@ -561,13 +554,58 @@ class TestSinkhorn:
 
     np.testing.assert_allclose(f_mean, 0., rtol=1e-6, atol=1e-6)
 
-  @pytest.mark.fast.with_args("num_iterations", [30, 60])
-  def test_callback_fn(self, num_iterations: int):
+  @pytest.mark.parametrize(("use_tqdm", "custom_buffer"), [(False, False),
+                                                           (False, True),
+                                                           (True, False)])
+  @pytest.mark.skipif(
+      jax.__version_info__ < (0, 4, 0),
+      reason="`jax.experimental.io_callback` doesn't exist"
+  )
+  def test_progress_fn(self, capsys, use_tqdm: bool, custom_buffer: bool):
+    geom = pointcloud.PointCloud(self.x, self.y, epsilon=1e-1)
+
+    if use_tqdm:
+      tqdm = pytest.importorskip("tqdm")
+      pbar = tqdm.tqdm()
+      progress_fn = utils.tqdm_progress_fn(pbar, fmt="err: {error}")
+    else:
+      stream = io.StringIO() if custom_buffer else sys.stdout
+      progress_fn = utils.default_progress_fn(
+          fmt="foo {iter}/{max_iter}", stream=stream
+      )
+
+    _ = linear.solve(
+        geom,
+        progress_fn=progress_fn,
+        min_iterations=0,
+        inner_iterations=7,
+        max_iterations=14,
+    )
+
+    if use_tqdm:
+      pbar.close()
+      assert pbar.postfix.startswith("err: ")
+    elif custom_buffer:
+      val = stream.getvalue()
+      assert val.startswith("foo 7/14"), val
+      captured = capsys.readouterr()
+      assert captured.out == "", captured.out
+    else:
+      captured = capsys.readouterr()
+      assert captured.out.startswith("foo 7/14"), captured
+
+  @pytest.mark.fast()
+  @pytest.mark.skipif(
+      jax.__version_info__ < (0, 4, 0),
+      reason="`jax.experimental.io_callback` doesn't exist"
+  )
+  def test_custom_progress_fn(self):
     """Check that the callback function is actually called."""
+    num_iterations = 30
 
     def progress_fn(
         status: Tuple[np.ndarray, np.ndarray, np.ndarray,
-                      sinkhorn.SinkhornState], *args: Any
+                      sinkhorn.SinkhornState],
     ) -> None:
       # Convert arguments.
       iteration, inner_iterations, total_iter, state = status

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional, Tuple
+from typing import Optional
 
 import chex
 import jax
@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 from ott.geometry import costs, geometry, pointcloud
 from ott.problems.linear import linear_problem
+from ott.solvers import linear
 from ott.solvers.linear import acceleration, sinkhorn
 from ott.solvers.linear import implicit_differentiation as implicit_lib
 
@@ -31,13 +32,11 @@ class TestSinkhornAnderson:
       lse_mode=[True, False],
       tau_a=[1.0, .98],
       tau_b=[1.0, .985],
-      shape=[(237, 153)],
-      refresh_anderson_frequency=[1, 3],
       only_fast=0,
   )
   def test_anderson(
       self, rng: jax.random.PRNGKeyArray, lse_mode: bool, tau_a: float,
-      tau_b: float, shape: Tuple[int, int], refresh_anderson_frequency: int
+      tau_b: float
   ):
     """Test efficiency of Anderson acceleration.
 
@@ -45,11 +44,9 @@ class TestSinkhornAnderson:
       lse_mode: whether to run in lse (True) or kernel (false) mode.
       tau_a: unbalanced parameter w.r.t. 1st marginal
       tau_b: unbalanced parameter w.r.t. 1st marginal
-      shape: shape of test problem
-      refresh_anderson_frequency: how often to Anderson interpolation should be
-        recomputed.
     """
-    n, m = shape
+    refresh_anderson_frequency = 3
+    n, m = (137, 153)
     dim = 4
     rngs = jax.random.split(rng, 9)
     x = jax.random.uniform(rngs[0], (n, dim)) / dim
@@ -175,8 +172,8 @@ class TestSinkhornOnline:
   @pytest.fixture(autouse=True)
   def initialize(self, rng: jax.random.PRNGKeyArray):
     self.dim = 3
-    self.n = 1000
-    self.m = 402
+    self.n = 100
+    self.m = 42
     self.rng, *rngs = jax.random.split(rng, 5)
     self.x = jax.random.uniform(rngs[0], (self.n, self.dim))
     self.y = jax.random.uniform(rngs[1], (self.m, self.dim))
@@ -188,7 +185,7 @@ class TestSinkhornOnline:
     self.a = a / jnp.sum(a)
     self.b = b / jnp.sum(b)
 
-  @pytest.mark.fast.with_args("batch_size", [1, 13, 402, 1000], only_fast=-1)
+  @pytest.mark.fast.with_args("batch_size", [1, 13, 42, 100], only_fast=-1)
   def test_online_matches_offline_size(self, batch_size: int):
     threshold, rtol, atol = 1e-1, 1e-6, 1e-6
     geom_offline = pointcloud.PointCloud(
@@ -198,12 +195,12 @@ class TestSinkhornOnline:
         self.x, self.y, epsilon=1, batch_size=batch_size
     )
 
-    sol_online = sinkhorn.solve(geom_online)
+    sol_online = linear.solve(geom_online)
     errors_online = sol_online.errors
     err_online = errors_online[errors_online > -1][-1]
     assert threshold > err_online
 
-    sol_offline = sinkhorn.solve(geom_offline)
+    sol_offline = linear.solve(geom_offline)
 
     np.testing.assert_allclose(
         sol_online.matrix, sol_offline.matrix, rtol=rtol, atol=atol
@@ -349,13 +346,19 @@ class TestSinkhornJIT:
         x: sinkhorn.SinkhornOutput, y: sinkhorn.SinkhornOutput
     ) -> None:
       """Assert SinkhornOutputs are close."""
-      x = tuple(a for a in x if (a is not None and isinstance(a, jnp.ndarray)))
-      y = tuple(a for a in y if (a is not None and isinstance(a, jnp.ndarray)))
+      x = tuple(
+          a for a in x
+          if (a is not None and (isinstance(a, (jnp.ndarray, int))))
+      )
+      y = tuple(
+          a for a in y
+          if (a is not None and (isinstance(a, (jnp.ndarray, int))))
+      )
       return chex.assert_trees_all_close(x, y, atol=1e-6, rtol=0)
 
     geom = self.geometry
-    jitted_result = jax.jit(sinkhorn.solve)(geom, a=self.a, b=self.b)
-    non_jitted_result = sinkhorn.solve(geom, a=self.a, b=self.b)
+    jitted_result = jax.jit(linear.solve)(geom, a=self.a, b=self.b)
+    non_jitted_result = linear.solve(geom, a=self.a, b=self.b)
     assert_output_close(non_jitted_result, jitted_result)
 
   @pytest.mark.parametrize("implicit", [False, True])

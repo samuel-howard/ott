@@ -25,21 +25,20 @@ from typing import (
 )
 
 import jax
+import jax.experimental
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental import host_callback
 
 from ott import utils
-from ott.geometry import geometry, low_rank, pointcloud
-from ott.initializers.linear import initializers_lr
+from ott.geometry import geometry
 from ott.initializers.quadratic import initializers as quad_initializers
 from ott.math import fixed_point_loop
 from ott.problems.linear import linear_problem
-from ott.problems.quadratic import quadratic_costs, quadratic_problem
+from ott.problems.quadratic import quadratic_problem
 from ott.solvers import was_solver
 from ott.solvers.linear import sinkhorn, sinkhorn_lr
 
-__all__ = ["GWOutput", "GromovWasserstein", "solve"]
+__all__ = ["GromovWasserstein", "GWOutput"]
 
 LinearOutput = Union[sinkhorn.SinkhornOutput, sinkhorn_lr.LRSinkhornOutput]
 
@@ -100,6 +99,12 @@ class GWOutput(NamedTuple):
     """Return transport cost of current linear OT solution at geometry."""
     return self.linear_state.transport_cost_at_geom(other_geom=self.geom)
 
+  @property
+  def n_iters(self) -> int:  # noqa: D102
+    if self.errors is None:
+      return -1
+    return jnp.sum(self.errors[:, 0] != -1)
+
 
 class GWState(NamedTuple):
   """State of the Gromov-Wasserstein solver.
@@ -158,29 +163,21 @@ class GWState(NamedTuple):
 class GromovWasserstein(was_solver.WassersteinSolver):
   """Gromov-Wasserstein solver :cite:`peyre:16`.
 
+  .. seealso::
+    Low-rank Gromov-Wasserstein :cite:`scetbon:23` is implemented in
+    :class:`~ott.solvers.quadratic.gromov_wasserstein_lr.LRGromovWasserstein`.
+
   Args:
     args: Positional arguments for
       :class:`~ott.solvers.was_solver.WassersteinSolver`.
-    warm_start: Whether to initialize (low-rank) Sinkhorn calls using values
-      from the previous iteration. If `None`, warm starts are not used for
-      standard Sinkhorn, but used for low-rank Sinkhorn.
-    unscale_last_linearization: Whether to remove any scaling from the
-      cost matrices of the last linearization stored in
-      :attr:`~ott.solvers.quadratic.gromov_wasserstein.GWOutput.geom`.
-      This has the practical benefit that, while the OT coupling matrices
-      obtained with GW might have been computed by re-scaling cost matrices for
-      numerical stability, the last linearization stored in the geometry will be
-      unscaled and recomputed with the original cost values.
+    warm_start: Whether to initialize Sinkhorn calls using values
+      from the previous iteration. If :obj:`None`, warm starts are not used for
+      standard Sinkhorn.
+    relative_epsilon: Whether to use relative epsilon in the linearized
+      geometry.
     quad_initializer: Quadratic initializer. If the solver is entropic,
       :class:`~ott.initializers.quadratic.initializers.QuadraticInitializer`
-      is always used. Otherwise, the quadratic initializer wraps the low-rank
-      Sinkhorn initializers. If `None`, the low-rank initializer will be
-      selected in a problem-specific manner. If both ``geom_xx`` and ``geom_yy``
-      are :class:`~ott.geometry.pointcloud.PointCloud` or
-      :class:`~ott.geometry.low_rank.LRCGeometry`, use
-      :class:`~ott.initializers.linear.initializers_lr.KMeansInitializer`.
-      Otherwise, use
-      :class:`~ott.initializers.linear.initializers_lr.RandomInitializer`.
+      is always used.
     progress_fn: callback function which gets called during the
       Gromov-Wasserstein iterations, so the user can display the error at each
       iteration, e.g., using a progress bar.
@@ -194,7 +191,7 @@ class GromovWasserstein(was_solver.WassersteinSolver):
       self,
       *args: Any,
       warm_start: Optional[bool] = None,
-      unscale_last_linearization: bool = False,
+      relative_epsilon: Optional[bool] = None,
       quad_initializer: Optional[
           Union[Literal["random", "rank2", "k-means", "generalized-k-means"],
                 quad_initializers.BaseQuadraticInitializer]] = None,
@@ -203,8 +200,11 @@ class GromovWasserstein(was_solver.WassersteinSolver):
       **kwargs: Any
   ):
     super().__init__(*args, **kwargs)
+    assert not self.is_low_rank, \
+      "For low-rank GW, use " \
+      "`ott.solvers.quadratic.gromov_wasserstein_lr.LRGromovWasserstein`."
     self._warm_start = warm_start
-    self.unscale_last_linearization = unscale_last_linearization
+    self.relative_epsilon = relative_epsilon
     self.quad_initializer = quad_initializer
     self.progress_fn = progress_fn
     self.kwargs_init = {} if kwargs_init is None else kwargs_init
@@ -236,21 +236,27 @@ class GromovWasserstein(was_solver.WassersteinSolver):
 
     if init is None:
       initializer = self.create_initializer(prob)
-      init = initializer(prob, epsilon=self.epsilon, rng=rng1, **kwargs)
+      init = initializer(
+          prob,
+          epsilon=self.epsilon,
+          rng=rng1,
+          relative_epsilon=self.relative_epsilon,
+          **kwargs
+      )
 
     out = iterations(self, prob, init, rng2)
     # TODO(lpapaxanthoos): remove stop_gradient when using backprop
     if self.is_low_rank:
       linearization = prob.update_lr_linearization(
           jax.lax.stop_gradient(out.linear_state),
-          remove_scale=self.unscale_last_linearization
+          relative_epsilon=self.relative_epsilon,
       )
     else:
       linearization = prob.update_linearization(
           jax.lax.stop_gradient(out.linear_state),
           epsilon=self.epsilon,
           old_transport_mass=jax.lax.stop_gradient(out.old_transport_mass),
-          remove_scale=self.unscale_last_linearization,
+          relative_epsilon=self.relative_epsilon,
       )
 
     linear_state = out.linear_state.set_cost(linearization, True, True)
@@ -332,41 +338,20 @@ class GromovWasserstein(was_solver.WassersteinSolver):
     if isinstance(
         self.quad_initializer, quad_initializers.BaseQuadraticInitializer
     ):
-      if self.is_low_rank:
-        assert isinstance(
-            self.quad_initializer, quad_initializers.LRQuadraticInitializer
-        ), f"Expected quadratic initializer to be low rank, " \
-           f"found `{type(self.quad_initializer).__name__}`."
-        assert self.quad_initializer.rank == self.rank, \
-            f"Expected quadratic initializer of rank `{self.rank}`, " \
-            f"found `{self.quad_initializer.rank}`."
       return self.quad_initializer
-
-    if self.is_low_rank:
-      if self.quad_initializer is None:
-        types = (pointcloud.PointCloud, low_rank.LRCGeometry)
-        kind = "k-means" if isinstance(prob.geom_xx, types) and isinstance(
-            prob.geom_yy, types
-        ) else "random"
-      else:
-        kind = self.quad_initializer
-      linear_lr_init = initializers_lr.LRInitializer.from_solver(
-          self, kind=kind, **self.kwargs_init
-      )
-      return quad_initializers.LRQuadraticInitializer(linear_lr_init)
-
+    # no other options implemented, use the default
     return quad_initializers.QuadraticInitializer(**self.kwargs_init)
 
   @property
   def warm_start(self) -> bool:
-    """Whether to initialize (low-rank) Sinkhorn using previous solutions."""
+    """Whether to initialize Sinkhorn using previous solutions."""
     return self.is_low_rank if self._warm_start is None else self._warm_start
 
   def tree_flatten(self) -> Tuple[Sequence[Any], Dict[str, Any]]:  # noqa: D102
     children, aux_data = super().tree_flatten()
     aux_data["warm_start"] = self._warm_start
     aux_data["progress_fn"] = self.progress_fn
-    aux_data["unscale_last_linearization"] = self.unscale_last_linearization
+    aux_data["relative_epsilon"] = self.relative_epsilon
     aux_data["quad_initializer"] = self.quad_initializer
     aux_data["kwargs_init"] = self.kwargs_init
     return children, aux_data
@@ -396,12 +381,17 @@ def iterations(
       rng = state.rngs[iteration]
       init = (lin_state.q, lin_state.r,
               lin_state.g) if solver.warm_start else (None, None, None)
-      linear_pb = prob.update_lr_linearization(state.linear_state)
+      linear_pb = prob.update_lr_linearization(
+          state.linear_state, relative_epsilon=solver.relative_epsilon
+      )
       out = solver.linear_ot_solver(linear_pb, init=init, rng=rng)
     else:
       init = (lin_state.f, lin_state.g) if solver.warm_start else (None, None)
       linear_pb = prob.update_linearization(
-          lin_state, solver.epsilon, state.old_transport_mass
+          lin_state,
+          solver.epsilon,
+          state.old_transport_mass,
+          relative_epsilon=solver.relative_epsilon,
       )
       out = solver.linear_ot_solver(linear_pb, init=init)
 
@@ -415,8 +405,8 @@ def iterations(
     # Inner iterations is currently fixed to 1.
     inner_iterations = 1
     if solver.progress_fn is not None:
-      host_callback.id_tap(
-          solver.progress_fn,
+      jax.experimental.io_callback(
+          solver.progress_fn, None,
           (iteration, inner_iterations, solver.max_iterations, state)
       )
 
@@ -433,102 +423,3 @@ def iterations(
   )
 
   return solver.output_from_state(state)
-
-
-def solve(
-    geom_xx: geometry.Geometry,
-    geom_yy: geometry.Geometry,
-    geom_xy: Optional[geometry.Geometry] = None,
-    fused_penalty: float = 1.0,
-    scale_cost: Optional[Union[bool, float, str]] = False,
-    a: Optional[jnp.ndarray] = None,
-    b: Optional[jnp.ndarray] = None,
-    loss: Union[Literal["sqeucl", "kl"], quadratic_costs.GWLoss] = "sqeucl",
-    tau_a: Optional[float] = 1.0,
-    tau_b: Optional[float] = 1.0,
-    gw_unbalanced_correction: bool = True,
-    ranks: Union[int, Tuple[int, ...]] = -1,
-    tolerances: Union[float, Tuple[float, ...]] = 1e-2,
-    **kwargs: Any,
-) -> GWOutput:
-  r"""Solve quadratic regularized OT problem.
-
-  The quadratic loss of a single OT matrix is assumed to
-  have the form given in :cite:`peyre:16`, eq. 4.
-
-  The two geometries below parameterize matrices :math:`C` and :math:`\bar{C}`
-  in that equation. The function :math:`L` (of two real values) in that equation
-  is assumed to match the form given in eq. 5., with our notations:
-
-  .. math::
-
-    L(x, y) = lin1(x) + lin2(y) - quad1(x) * quad2(y)
-
-  Args:
-    geom_xx: Ground geometry of the first space.
-    geom_yy: Ground geometry of the second space.
-    geom_xy: Geometry defining the linear penalty term for
-      Fused Gromov-Wasserstein. If `None`, the problem reduces to
-      a plain Gromov-Wasserstein problem.
-    fused_penalty: multiplier of the linear term in Fused Gromov-Wasserstein,
-      i.e. problem = purely quadratic + fused_penalty * linear problem.
-      Ignored if ``geom_xy`` is not specified.
-    scale_cost: option to rescale the cost matrices:
-
-      - if :obj:`True`, use the default for each geometry.
-      - if :obj:`False`, keep the original scaling in geometries.
-      - if :class:`str`, use a specific method available in
-        :class:`~ott.geometry.geometry.Geometry` or
-        :class:`~ott.geometry.pointcloud.PointCloud`.
-      - if :obj:`None`, do not scale the cost matrices.
-
-    a: array representing the probability weights of the samples
-      from ``geom_xx``. If `None`, it will be uniform.
-    b: array representing the probability weights of the samples
-      from ``geom_yy``. If `None`, it will be uniform.
-    loss: a 2-tuple of 2-tuples of Callable. The first tuple is the linear
-      part of the loss. The second one is the quadratic part (quad1, quad2).
-      By default, the loss is set as the 4 functions representing the squared
-      Euclidean loss, and this property is taken advantage of in subsequent
-      computations. Alternatively, KL loss can be specified in no less optimized
-      way.
-    tau_a: if `< 1.0`, defines how much unbalanced the problem is on
-      the first marginal.
-    tau_b: if `< 1.0`, defines how much unbalanced the problem is on
-      the second marginal.
-    gw_unbalanced_correction: Whether the unbalanced version of
-      :cite:`sejourne:21` is used. Otherwise, ``tau_a`` and ``tau_b`` only
-      affect the inner Sinkhorn loop.
-    ranks: Ranks of the cost matrices, see
-      :meth:`~ott.geometry.geometry.Geometry.to_LRCGeometry`. Used when
-      geometries are *not* :class:`~ott.geometry.pointcloud.PointCloud` with
-      `'sqeucl'` cost function. If `-1`, the geometries will not be converted
-      to low-rank. If :class:`tuple`, it specifies the ranks of ``geom_xx``,
-      ``geom_yy`` and ``geom_xy``, respectively. If :class:`int`, rank is shared
-      across all geometries.
-    tolerances: Tolerances used when converting geometries to low-rank. Used
-      when geometries are not :class:`~ott.geometry.pointcloud.PointCloud` with
-      `'sqeucl'` cost. If :class:`float`, it is shared across all geometries.
-    kwargs: Keyword arguments for
-      :class:`~ott.solvers.quadratic.gromov_wasserstein.GromovWasserstein`.
-
-  Returns:
-    Gromov-Wasserstein output.
-  """
-  prob = quadratic_problem.QuadraticProblem(
-      geom_xx,
-      geom_yy,
-      geom_xy=geom_xy,
-      fused_penalty=fused_penalty,
-      scale_cost=scale_cost,
-      a=a,
-      b=b,
-      loss=loss,
-      tau_a=tau_a,
-      tau_b=tau_b,
-      gw_unbalanced_correction=gw_unbalanced_correction,
-      ranks=ranks,
-      tolerances=tolerances
-  )
-  solver = GromovWasserstein(**kwargs)
-  return solver(prob)

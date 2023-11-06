@@ -107,7 +107,7 @@ spelling_add_pypi_package_names = True
 # flax misspelled words; `flax.linen.Module.bind` is ignored in `class.rst`
 # because of indentation error that cannot be suppressed
 spelling_exclude_patterns = [
-    "references.rst",
+    "bibliography.rst",
     "**setup.rst",
     "**lazy_init.rst",
     "**is_initializing.rst",
@@ -125,6 +125,9 @@ linkcheck_ignore = [
     "https://doi.org/10.1137/17M1140431",
     "https://doi.org/10.1137/141000439",
     "https://doi.org/10.1002/mana.19901470121",
+    "https://doi.org/10.1145/2516971.2516977",
+    "https://doi.org/10.1145/2766963",
+    "https://keras.io/examples/nlp/pretrained_word_embeddings/",
 ]
 
 # List of patterns, relative to source directory, that match files and
